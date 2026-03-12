@@ -8,6 +8,7 @@ import yaml
 
 from database.db      import init_db, is_seen, save_article
 from searchers        import baidu_news, wechat_sogou, bing_news
+from searchers.filter import is_tutorial
 from summarizer.kimi  import summarize
 from reporter.markdown import generate
 
@@ -55,7 +56,11 @@ def main():
     for company in companies:
         print(f"▶ [{company}]")
         articles = search_company(company)
-        print(f"  共获取 {len(articles)} 条，开始去重和摘要...")
+        # 过滤教程类文章
+        before = len(articles)
+        articles = [a for a in articles if not is_tutorial(a)]
+        filtered = before - len(articles)
+        print(f"  共获取 {before} 条，过滤教程 {filtered} 条，剩余 {len(articles)} 条，开始去重和摘要...")
 
         new_articles = []
         for art in articles:
