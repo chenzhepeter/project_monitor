@@ -1,68 +1,89 @@
-"""微信公众号文章搜索（通过搜狗微信，带 session cookie 重试）"""
-import re
+"""微信公众号文章搜索（Playwright 无头浏览器，持久化 cookie）"""
 import time
-import requests
-from bs4 import BeautifulSoup
-from config import HEADERS, MAX_ARTICLES_PER_SOURCE, REQUEST_DELAY
+from pathlib import Path
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from config import MAX_ARTICLES_PER_SOURCE, REQUEST_DELAY
+
+# 持久化浏览器 context 目录（保存 cookie/localStorage，减少验证触发）
+_CONTEXT_DIR = str(Path(__file__).parent.parent / "data" / "wechat_browser")
 
 
 def search(company: str) -> list[dict]:
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    with sync_playwright() as p:
+        # launch_persistent_context 自动保存并复用 cookie
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=_CONTEXT_DIR,
+            headless=True,
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+            locale="zh-CN",
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        page = context.new_page()
 
-    # 先访问首页获取 cookie
-    try:
-        session.get("https://weixin.sogou.com/", timeout=8)
-    except Exception:
-        pass
-
-    url = "https://weixin.sogou.com/weixin"
-    params = {"type": "2", "query": company, "page": 1, "ie": "utf8"}
-
-    try:
-        resp = session.get(url, params=params, timeout=10)
-        resp.encoding = "utf-8"
-    except Exception as e:
-        print(f"  [微信搜狗] 请求失败: {e}")
-        return []
-
-    # 被拦截（返回验证页）时直接跳过
-    if len(resp.text) < 8000 or "验证" in resp.text[:500]:
-        print("  [微信搜狗] 触发验证，跳过")
-        return []
-
-    soup = BeautifulSoup(resp.text, "lxml")
-    results = []
-
-    for item in soup.select("ul.news-list li")[:MAX_ARTICLES_PER_SOURCE]:
         try:
-            title_el = item.select_one("h3 a")
-            if not title_el:
-                continue
-            title = title_el.get_text(strip=True)
-            link  = title_el.get("href", "")
-            if link.startswith("/"):
-                link = "https://weixin.sogou.com" + link
+            url = (
+                f"https://weixin.sogou.com/weixin"
+                f"?type=2&query={company}&page=1&ie=utf8"
+            )
+            page.goto(url, timeout=15000, wait_until="domcontentloaded")
+            time.sleep(2)  # 等待 JS 渲染完毕
 
-            snippet_el = item.select_one("p.txt-info")
-            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+            # 检测验证码拦截页面
+            if "antispider" in page.url or "验证码" in page.inner_text("body")[:200]:
+                print("  [微信] ⚠️ 需要验证码，请先运行：python setup_wechat.py")
+                return []
 
-            time_el = item.select_one("date, span.s2")
-            pub_time = time_el.get_text(strip=True) if time_el else ""
+            # 提取文章列表
+            items = page.query_selector_all("ul.news-list li")
+            if not items:
+                # 页面可能为空或被拦截
+                return []
 
-            account_el = item.select_one(".account")
-            account = account_el.get_text(strip=True) if account_el else ""
-            source  = f"微信·{account}" if account else "微信公众号"
+            results = []
+            for item in items[:MAX_ARTICLES_PER_SOURCE]:
+                try:
+                    title_el = item.query_selector("h3 a")
+                    if not title_el:
+                        continue
+                    title = title_el.inner_text().strip()
+                    link  = title_el.get_attribute("href") or ""
+                    if link.startswith("/"):
+                        link = "https://weixin.sogou.com" + link
 
-            if not title or not link:
-                continue
+                    snippet_el = item.query_selector("p.txt-info")
+                    snippet = snippet_el.inner_text().strip() if snippet_el else ""
 
-            results.append({
-                "title": title, "url": link, "snippet": snippet,
-                "published_at": pub_time, "source": source,
-            })
-        except Exception:
-            continue
+                    time_el = item.query_selector("date, span.s2")
+                    pub_time = time_el.inner_text().strip() if time_el else ""
 
-    time.sleep(REQUEST_DELAY)
-    return results
+                    account_el = item.query_selector(".account")
+                    account = account_el.inner_text().strip() if account_el else ""
+                    source = f"微信·{account}" if account else "微信公众号"
+
+                    if title and link:
+                        results.append({
+                            "title"       : title,
+                            "url"         : link,
+                            "snippet"     : snippet,
+                            "published_at": pub_time,
+                            "source"      : source,
+                        })
+                except Exception:
+                    continue
+
+            time.sleep(REQUEST_DELAY)
+            return results
+
+        except PWTimeout:
+            print("  [微信] 超时，跳过")
+            return []
+        except Exception as e:
+            print(f"  [微信] 错误: {e}")
+            return []
+        finally:
+            context.close()
